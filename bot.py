@@ -418,22 +418,26 @@ def check_user_subscription(user_id: int, group_id: int) -> Optional[bool]:
             user_id=user_id
         )
 
+        result = None
         if isinstance(response, list) and len(response) > 0:
             member = response[0].get('member', 0)
-            return member == 1
+            result = member == 1
         elif isinstance(response, dict):
             member = response.get('member', 0)
-            return member == 1
+            result = member == 1
         elif isinstance(response, int):
-            return response == 1
+            result = response == 1
+        else:
+            result = False
 
-        return False
+        print(f"   📊 Подписка на club{group_id}: {'✅ ЕСТЬ' if result else '❌ НЕТ'}", flush=True)
+        return result
 
     except ApiError as e:
-        print(f"   ⚠️ VK API ошибка проверки подписки: {e}", flush=True)
+        print(f"   ⚠️ VK API ошибка проверки подписки на club{group_id}: {e}", flush=True)
         return None
     except Exception as e:
-        print(f"   ⚠️ Ошибка сети при проверке подписки: {e}", flush=True)
+        print(f"   ⚠️ Ошибка сети при проверке подписки на club{group_id}: {e}", flush=True)
         return None
 
 
