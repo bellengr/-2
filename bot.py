@@ -862,7 +862,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
     if not short_name:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nПример: vk.com/club123 или vk.com/public123")
+        send_message(peer_id, "🔗 Публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nПример: vk.com/club123 или vk.com/public123\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     base_patterns = [
@@ -881,20 +881,20 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
     if stripped not in base_patterns:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Сообщение должно содержать ТОЛЬКО ссылку на сообщество!")
+        send_message(peer_id, "🔗 Сообщение должно содержать ТОЛЬКО ссылку на сообщество!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     group_info = resolve_group(short_name)
     if not group_info:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nЛичные страницы, посты, фото и видео — не принимаются.")
+        send_message(peer_id, "🔗 Публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nЛичные страницы, посты, фото и видео — не принимаются.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     if group_info['is_closed'] != 0:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Публикуем только ОТКРЫТЫЕ сообщества!\n\nЗакрытые и частные сообщества не принимаются.")
+        send_message(peer_id, "🔗 Публикуем только ОТКРЫТЫЕ сообщества!\n\nЗакрытые и частные сообщества не принимаются.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     gid = group_info['id']
@@ -904,7 +904,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         need = max(0, 5 - get_posts_after_user(user_id))
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, f"⏳ Ждем Вас через {need} сообществ!")
+        send_message(peer_id, f"⏳ Ждем Вас через {need} сообществ!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     # ===== ПРОВЕРКА VIP-СООБЩЕСТВ =====
@@ -927,7 +927,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
                 text += f"\n{'─' * 30}\n"
                 text += "⏳ На выполнение даётся 5 минут!\n"
                 text += "✅ После того, как подпишешься, отправь свою ссылку снова.\n\n"
-                text += "💎 Хочешь себе статус VIP? Обращайся к владельцу чата"
+                text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
                 send_message(peer_id, text)
                 return
 
@@ -951,7 +951,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             text += f"\n{'─' * 30}\n"
             text += "⏳ На выполнение даётся 5 минут!\n"
             text += "✅ После того, как подпишешься, отправь свою ссылку снова.\n\n"
-            text += "💎 Хочешь себе статус VIP? Обращайся к владельцу чата"
+            text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
             send_message(peer_id, text)
             return
 
@@ -977,7 +977,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
 
     text = f"✅ Ваше сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}\n📊 В очереди: {len(queue)}\n\n"
     text += "⏳ Ждем Вас через 5 сообществ!\n\n"
-    text += "💎 Хочешь себе статус VIP? Обращайся к владельцу чата"
+    text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
     send_message(peer_id, text)
     print(f"   ✅ Опубликовано!", flush=True)
 
