@@ -55,6 +55,11 @@ vk_user = None
 user_activity = {}
 activity_lock = threading.Lock()
 
+# Кэш имён пользователей
+user_name_cache = {}  # {user_id: (name, timestamp)}
+user_name_cache_lock = threading.Lock()
+USER_NAME_CACHE_TTL = 3600  # 1 час
+
 pending_deletions = []
 deletions_lock = threading.Lock()
 
@@ -72,6 +77,44 @@ def make_clickable_link(group_link: str) -> str:
 
 def is_owner(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def get_user_name(user_id: int) -> str:
+    """Получает имя пользователя с кэшированием"""
+    global vk_user
+    if vk_user is None:
+        return ""
+    
+    now = time.time()
+    
+    # Проверяем кэш
+    with user_name_cache_lock:
+        if user_id in user_name_cache:
+            name, ts = user_name_cache[user_id]
+            if now - ts < USER_NAME_CACHE_TTL:
+                return name
+    
+    # Запрашиваем у VK API
+    try:
+        rate_limit()
+        user_info = vk_user.users.get(user_ids=[user_id])[0]
+        name = f"{user_info['first_name']} {user_info['last_name']}"
+        
+        with user_name_cache_lock:
+            user_name_cache[user_id] = (name, now)
+        
+        return name
+    except Exception as e:
+        print(f"⚠️ Не удалось получить имя пользователя {user_id}: {e}", flush=True)
+        return ""
+
+
+def get_mention(user_id: int) -> str:
+    """Возвращает упоминание пользователя в формате ВК"""
+    name = get_user_name(user_id)
+    if name:
+        return f"[id{user_id}|{name}]"
+    return f"[id{user_id}|пользователь]"
 
 
 def init_database():
@@ -827,6 +870,9 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         handle_admin_commands(text, user_id, peer_id, message_id)
         return
 
+    # Получаем упоминание пользователя
+    mention = get_mention(user_id)
+
     # === ПУБЛИКАЦИЯ СООБЩЕСТВА АДМИНИСТРАТОРОМ ===
     if is_owner(user_id):
         short_name = extract_group_short_name(text)
@@ -835,7 +881,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
 
         group_info = resolve_group(short_name)
         if not group_info or group_info['is_closed'] != 0:
-            send_message(peer_id, "⚠️ Публикуем только открытые сообщества!")
+            send_message(peer_id, f"{mention}, ⚠️ публикуем только открытые сообщества!")
             return
 
         gid = group_info['id']
@@ -851,7 +897,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             if len(queue) > MAX_QUEUE_SIZE:
                 queue.pop(0)
             save_queue()
-        send_message(peer_id, f"✅ Сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}")
+        send_message(peer_id, f"{mention}, ✅ сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}")
         return
 
     # === ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ ===
@@ -862,7 +908,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
     if not short_name:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nПример: vk.com/club123 или vk.com/public123\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
+        send_message(peer_id, f"{mention}, 🔗 публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nПример: vk.com/club123 или vk.com/public123\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     base_patterns = [
@@ -881,20 +927,20 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
     if stripped not in base_patterns:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Сообщение должно содержать ТОЛЬКО ссылку на сообщество!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
+        send_message(peer_id, f"{mention}, 🔗 сообщение должно содержать ТОЛЬКО ссылку на сообщество!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     group_info = resolve_group(short_name)
     if not group_info:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nЛичные страницы, посты, фото и видео — не принимаются.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
+        send_message(peer_id, f"{mention}, 🔗 публикуем только ссылки на ОТКРЫТЫЕ сообщества!\n\nЛичные страницы, посты, фото и видео — не принимаются.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     if group_info['is_closed'] != 0:
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, "🔗 Публикуем только ОТКРЫТЫЕ сообщества!\n\nЗакрытые и частные сообщества не принимаются.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
+        send_message(peer_id, f"{mention}, 🔗 публикуем только ОТКРЫТЫЕ сообщества!\n\nЗакрытые и частные сообщества не принимаются.\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     gid = group_info['id']
@@ -904,7 +950,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         need = max(0, 5 - get_posts_after_user(user_id))
         if message_id:
             delete_message_by_conv_id(peer_id, message_id)
-        send_message(peer_id, f"⏳ Ждем Вас через {need} сообществ!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
+        send_message(peer_id, f"{mention}, ⏳ ждем Вас через {need} сообществ!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
     # ===== ПРОВЕРКА VIP-СООБЩЕСТВ =====
@@ -921,7 +967,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             if missing_vip:
                 if message_id:
                     delete_message_by_conv_id(peer_id, message_id)
-                text = "⭐ Обязательно подпишись на VIP-сообщества:\n\n"
+                text = f"{mention}, ⭐ обязательно подпишись на VIP-сообщества:\n\n"
                 for vip in missing_vip:
                     text += f"⭐ {make_clickable_link(vip['link'])}\n"
                 text += f"\n{'─' * 30}\n"
@@ -945,7 +991,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         if missing_regular:
             if message_id:
                 delete_message_by_conv_id(peer_id, message_id)
-            text = "📋 Обязательно подпишись на предыдущие 10 сообществ:\n\n"
+            text = f"{mention}, 📋 обязательно подпишись на предыдущие 10 сообществ:\n\n"
             for item in missing_regular:
                 text += f"▫️ {make_clickable_link(item['link'])}\n"
             text += f"\n{'─' * 30}\n"
@@ -975,7 +1021,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         }
     save_user_activity(user_id)
 
-    text = f"✅ Ваше сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}\n📊 В очереди: {len(queue)}\n\n"
+    text = f"{mention}, ✅ ваше сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}\n📊 В очереди: {len(queue)}\n\n"
     text += "⏳ Ждем Вас через 5 сообществ!\n\n"
     text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
     send_message(peer_id, text)
