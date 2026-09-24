@@ -40,7 +40,7 @@ DELETE_AFTER = 300  # 5 минут
 
 MAX_QUEUE_SIZE = 10
 VIP_DURATION_HOURS = 24
-RATE_LIMIT_DELAY = 0.34
+RATE_LIMIT_DELAY = 0.5  # Увеличено с 0.34 для избежания ошибок 29
 DB_FILE = "subscriptions_bot.db"
 
 queue = []                  # [{'group_id': int, 'link': str, 'user_id': int, 'timestamp': datetime}]
@@ -48,6 +48,9 @@ queue_lock = threading.Lock()
 
 vip_groups = []             # [{'group_id': int, 'link': str, 'added_by': int, 'expires_at': datetime}]
 vip_groups_lock = threading.Lock()
+
+skip_subscriptions = {}     # {(user_id, group_id): added_at}
+skip_subscriptions_lock = threading.Lock()
 
 vk_group = None
 vk_user = None
@@ -87,14 +90,12 @@ def get_user_name(user_id: int) -> str:
     
     now = time.time()
     
-    # Проверяем кэш
     with user_name_cache_lock:
         if user_id in user_name_cache:
             name, ts = user_name_cache[user_id]
             if now - ts < USER_NAME_CACHE_TTL:
                 return name
     
-    # Запрашиваем у VK API
     try:
         rate_limit()
         user_info = vk_user.users.get(user_ids=[user_id])[0]
@@ -115,6 +116,86 @@ def get_mention(user_id: int) -> str:
     if name:
         return f"[id{user_id}|{name}]"
     return f"[id{user_id}|пользователь]"
+
+
+def get_user_id_by_link(link: str) -> Optional[int]:
+    """
+    Получает ID пользователя по ссылке на его страницу ВКонтакте.
+    """
+    global vk_user
+    if vk_user is None:
+        return None
+    
+    match = re.search(r'(?:https?://)?(?:m\.)?vk\.(?:com|ru)/([a-zA-Z0-9_.]+)', link)
+    if not match:
+        return None
+    
+    username = match.group(1)
+    
+    if username.lower() in ('wall', 'photo', 'video', 'clip', 'audio', 'topic',
+                            'market', 'album', 'poll', 'note', 'doc', 'feed',
+                            'im', 'friends', 'groups', 'videos', 'audios', 'photos'):
+        return None
+    
+    # Если это уже ID (id123)
+    if username.startswith('id') and username[2:].isdigit():
+        return int(username[2:])
+    
+    # Иначе резолвим через API
+    try:
+        rate_limit()
+        response = vk_user.users.get(user_ids=[username])
+        if isinstance(response, list) and len(response) > 0:
+            return response[0].get('id')
+    except Exception as e:
+        print(f"⚠️ Ошибка получения ID: {e}", flush=True)
+        return None
+    
+    return None
+
+
+def add_skip_subscription(user_id: int, group_id: int):
+    """Добавляет исключение: пользователь не проверяется на подписку к сообществу"""
+    global skip_subscriptions
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO skip_subscriptions (user_id, group_id, added_at)
+            VALUES (?, ?, ?)
+        ''', (user_id, group_id, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        
+        with skip_subscriptions_lock:
+            skip_subscriptions[(user_id, group_id)] = datetime.now()
+        print(f"✅ Исключение добавлено: user={user_id}, group={group_id}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Ошибка добавления исключения: {e}", flush=True)
+
+
+def remove_skip_subscription(user_id: int, group_id: int):
+    """Удаляет исключение"""
+    global skip_subscriptions
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM skip_subscriptions WHERE user_id = ? AND group_id = ?',
+                      (user_id, group_id))
+        conn.commit()
+        conn.close()
+        
+        with skip_subscriptions_lock:
+            skip_subscriptions.pop((user_id, group_id), None)
+        print(f"🗑️ Исключение удалено: user={user_id}, group={group_id}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления исключения: {e}", flush=True)
+
+
+def is_skip_subscription(user_id: int, group_id: int) -> bool:
+    """Проверяет, есть ли исключение для пользователя и сообщества"""
+    with skip_subscriptions_lock:
+        return (user_id, group_id) in skip_subscriptions
 
 
 def init_database():
@@ -154,6 +235,15 @@ def init_database():
                 created_at TEXT NOT NULL
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS skip_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                added_at TEXT NOT NULL,
+                UNIQUE(user_id, group_id)
+            )
+        ''')
         conn.commit()
         conn.close()
         print("✅ База данных инициализирована")
@@ -163,7 +253,7 @@ def init_database():
 
 
 def load_data():
-    global queue, vip_groups, user_activity, pending_deletions
+    global queue, vip_groups, user_activity, pending_deletions, skip_subscriptions
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -207,8 +297,13 @@ def load_data():
                 'created_at': datetime.fromisoformat(row[2])
             })
 
+        cursor.execute('SELECT user_id, group_id, added_at FROM skip_subscriptions')
+        skip_subscriptions = {}
+        for row in cursor.fetchall():
+            skip_subscriptions[(row[0], row[1])] = datetime.fromisoformat(row[2])
+
         conn.close()
-        print(f"📂 Загружено: {len(queue)} сообществ, {len(vip_groups)} VIP, {len(pending_deletions)} на удаление")
+        print(f"📂 Загружено: {len(queue)} сообществ, {len(vip_groups)} VIP, {len(pending_deletions)} на удаление, {len(skip_subscriptions)} исключений")
     except Exception as e:
         print(f"⚠️ Ошибка загрузки: {e}")
     sys.stdout.flush()
@@ -350,17 +445,11 @@ def rate_limit():
 
 
 def extract_group_short_name(text: str) -> Optional[str]:
-    """
-    Извлекает короткое имя/ID сообщества из текста.
-    Возвращает: 'club123', 'public123', 'event123' или 'short_name'
-    Или None, если это не похоже на сообщество.
-    """
     if not text:
         return None
 
     text = text.strip()
 
-    # Сначала проверяем, что это не пост/фото/видео/личная страница
     forbidden_patterns = [
         r'wall-?\d+_\d+',
         r'photo-?\d+_\d+',
@@ -378,16 +467,13 @@ def extract_group_short_name(text: str) -> Optional[str]:
         if re.search(pattern, text):
             return None
 
-    # Ищем clubXXX / publicXXX / eventXXX
     match = re.search(r'\b(club\d+|public\d+|event\d+)\b', text)
     if match:
         return match.group(1)
 
-    # Ищем vk.com/XXX или vk.ru/XXX
     url_match = re.search(r'(?:https?://)?(?:m\.)?vk\.(?:com|ru)/([a-zA-Z0-9_.]+)', text)
     if url_match:
         candidate = url_match.group(1)
-        # Отсекаем служебные пути
         if candidate.lower() in ('wall', 'photo', 'video', 'clip', 'audio', 'topic',
                                  'market', 'album', 'poll', 'note', 'doc', 'feed',
                                  'im', 'friends', 'groups', 'videos', 'audios', 'photos'):
@@ -398,11 +484,6 @@ def extract_group_short_name(text: str) -> Optional[str]:
 
 
 def resolve_group(short_name_or_id: str) -> Optional[dict]:
-    """
-    Резолвит короткое имя или clubXXX в полноценные данные сообщества.
-    Возвращает: {'id': int, 'screen_name': str, 'name': str, 'is_closed': int}
-    или None, если это не сообщество / не открытое.
-    """
     global vk_group
     if vk_group is None:
         return None
@@ -439,13 +520,114 @@ def resolve_group(short_name_or_id: str) -> Optional[dict]:
         return None
 
 
-def check_user_subscription(user_id: int, group_id: int) -> Optional[bool]:
+def parse_is_member_response(item) -> Optional[bool]:
     """
-    Проверяет, подписан ли user_id на сообщество group_id.
+    Разбирает ответ от groups.isMember.
     Возвращает:
       True  — точно подписан
       False — точно не подписан
-      None  — не смогли проверить
+      None  — не удалось проверить (скрытые подписчики, ошибка)
+    """
+    if item is None:
+        return None
+    
+    # Если это ошибка
+    if isinstance(item, dict) and 'error' in item:
+        error_code = item['error'].get('error_code')
+        print(f"   ⚠️ Ошибка в ответе: {error_code}", flush=True)
+        return None
+    
+    # Если это список (старый формат)
+    if isinstance(item, list):
+        if len(item) == 0:
+            return None
+        item = item[0]
+    
+    # Если это словарь
+    if isinstance(item, dict):
+        # Если вообще нет ключа 'member' — значит, не смогли проверить
+        # (например, у сообщества скрыты подписчики)
+        if 'member' not in item:
+            print(f"   ⚠️ Ключ 'member' отсутствует (скрытые подписчики?)", flush=True)
+            return None
+        
+        member = item.get('member')
+        if member == 1:
+            return True
+        elif member == 0:
+            return False
+        else:
+            return None
+    
+    # Если это число
+    if isinstance(item, int):
+        if item == 1:
+            return True
+        elif item == 0:
+            return False
+        else:
+            return None
+    
+    return None
+
+
+def check_subscriptions_batch(user_id: int, group_ids: list) -> dict:
+    """
+    Проверяет подписки на несколько сообществ за один запрос через execute.
+    Возвращает: {group_id: True/False/None}
+      True  — точно подписан
+      False — точно не подписан
+      None  — не смогли проверить (скрытые подписчики, ошибка, rate limit)
+    """
+    global vk_group
+    if vk_group is None or not group_ids:
+        return {}
+    
+    results = {}
+    batch_size = 25  # Максимум 25 запросов за раз
+    
+    for i in range(0, len(group_ids), batch_size):
+        batch = group_ids[i:i + batch_size]
+        
+        # Формируем код для execute
+        code_parts = []
+        for gid in batch:
+            code_parts.append(f'API.groups.isMember({{"group_id": {gid}, "user_id": {user_id}}})')
+        
+        code = f'return [{", ".join(code_parts)}];'
+        
+        try:
+            rate_limit()
+            result = vk_group.execute(code=code)
+            
+            if isinstance(result, list):
+                for j, gid in enumerate(batch):
+                    if j < len(result):
+                        item = result[j]
+                        parsed = parse_is_member_response(item)
+                        results[gid] = parsed
+                    else:
+                        results[gid] = None
+            else:
+                for gid in batch:
+                    results[gid] = None
+                    
+        except ApiError as e:
+            print(f"   ⚠️ Ошибка execute (batch): {e}", flush=True)
+            for gid in batch:
+                results[gid] = None
+        except Exception as e:
+            print(f"   ⚠️ Ошибка сети: {e}", flush=True)
+            for gid in batch:
+                results[gid] = None
+    
+    return results
+
+
+def check_user_subscription(user_id: int, group_id: int) -> Optional[bool]:
+    """
+    Проверяет подписку одного пользователя на одно сообщество.
+    (Используется как fallback)
     """
     global vk_user
     if vk_user is None:
@@ -461,26 +643,14 @@ def check_user_subscription(user_id: int, group_id: int) -> Optional[bool]:
             user_id=user_id
         )
 
-        result = None
-        if isinstance(response, list) and len(response) > 0:
-            member = response[0].get('member', 0)
-            result = member == 1
-        elif isinstance(response, dict):
-            member = response.get('member', 0)
-            result = member == 1
-        elif isinstance(response, int):
-            result = response == 1
-        else:
-            result = False
-
-        print(f"   📊 Подписка на club{group_id}: {'✅ ЕСТЬ' if result else '❌ НЕТ'}", flush=True)
-        return result
+        parsed = parse_is_member_response(response)
+        return parsed
 
     except ApiError as e:
-        print(f"   ⚠️ VK API ошибка проверки подписки на club{group_id}: {e}", flush=True)
+        print(f"   ⚠️ VK API ошибка: {e}", flush=True)
         return None
     except Exception as e:
-        print(f"   ⚠️ Ошибка сети при проверке подписки на club{group_id}: {e}", flush=True)
+        print(f"   ⚠️ Ошибка сети: {e}", flush=True)
         return None
 
 
@@ -503,9 +673,6 @@ def get_posts_after_user(user_id: int) -> int:
 
 
 def vk_api_request(method: str, params: dict) -> dict:
-    """
-    Прямой запрос к VK API через HTTP (для messages.send / messages.delete).
-    """
     url = f"https://api.vk.com/method/{method}"
 
     params['v'] = VK_API_VERSION
@@ -528,9 +695,6 @@ def vk_api_request(method: str, params: dict) -> dict:
 
 
 def send_message(peer_id: int, text: str) -> Optional[int]:
-    """
-    Отправка сообщения через прямой HTTP-запрос с peer_ids.
-    """
     global pending_deletions
 
     try:
@@ -579,9 +743,6 @@ def send_message(peer_id: int, text: str) -> Optional[int]:
 
 
 def delete_message_by_conv_id(peer_id: int, conv_message_id: int) -> bool:
-    """
-    Удаление сообщения по conversation_message_id через прямой HTTP-запрос.
-    """
     try:
         rate_limit()
 
@@ -629,7 +790,6 @@ def delete_message_by_conv_id(peer_id: int, conv_message_id: int) -> bool:
 
 
 def cleanup_worker():
-    """Фоновый воркер для удаления сообщений бота"""
     global pending_deletions
     print("🔄 Воркер удаления запущен", flush=True)
 
@@ -849,6 +1009,83 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, result)
         return True
 
+    # ===== КОМАНДА !skip =====
+    if text_lower.startswith('!skip '):
+        parts = text.split()
+        if len(parts) < 3:
+            send_message(peer_id, "⚠️ Использование: !skip [ссылка на участника] [ссылка на сообщество]\n\nПример: !skip vk.com/id123456789 vk.com/club241426297")
+            return True
+
+        user_link = parts[1]
+        group_link = parts[2]
+
+        target_user_id = get_user_id_by_link(user_link)
+        if not target_user_id:
+            send_message(peer_id, "❌ Не удалось найти пользователя по ссылке!")
+            return True
+
+        short_name = extract_group_short_name(group_link)
+        if not short_name:
+            send_message(peer_id, "❌ Не удалось распознать ссылку на сообщество!")
+            return True
+
+        group_info = resolve_group(short_name)
+        if not group_info:
+            send_message(peer_id, "❌ Не удалось найти сообщество!")
+            return True
+
+        gid = group_info['id']
+        add_skip_subscription(target_user_id, gid)
+
+        user_mention = get_mention(target_user_id)
+        send_message(peer_id, f"✅ Исключение добавлено!\n\n👤 Участник: {user_mention}\n📛 Сообщество: {group_info['name']}\n\nТеперь этот участник может пропустить проверку подписки на это сообщество.")
+        return True
+
+    # ===== КОМАНДА !unskip =====
+    if text_lower.startswith('!unskip '):
+        parts = text.split()
+        if len(parts) < 3:
+            send_message(peer_id, "⚠️ Использование: !unskip [ссылка на участника] [ссылка на сообщество]")
+            return True
+
+        user_link = parts[1]
+        group_link = parts[2]
+
+        target_user_id = get_user_id_by_link(user_link)
+        if not target_user_id:
+            send_message(peer_id, "❌ Не удалось найти пользователя по ссылке!")
+            return True
+
+        short_name = extract_group_short_name(group_link)
+        if not short_name:
+            send_message(peer_id, "❌ Не удалось распознать ссылку на сообщество!")
+            return True
+
+        group_info = resolve_group(short_name)
+        if not group_info:
+            send_message(peer_id, "❌ Не удалось найти сообщество!")
+            return True
+
+        gid = group_info['id']
+        remove_skip_subscription(target_user_id, gid)
+
+        user_mention = get_mention(target_user_id)
+        send_message(peer_id, f"✅ Исключение удалено!\n\n👤 Участник: {user_mention}\n📛 Сообщество: {group_info['name']}\n\nТеперь участник снова проверяется на подписку.")
+        return True
+
+    # ===== КОМАНДА !skip_list =====
+    if text_lower == '!skip_list':
+        with skip_subscriptions_lock:
+            if not skip_subscriptions:
+                send_message(peer_id, "📭 Исключений нет")
+                return True
+            result = "📋 Активные исключения:\n\n"
+            for (uid, gid) in skip_subscriptions.keys():
+                user_mention = get_mention(uid)
+                result += f"👤 {user_mention} → 🔗 club{gid}\n"
+            send_message(peer_id, result)
+        return True
+
     return False
 
 
@@ -863,7 +1100,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
 
     text_lower = text.lower().strip()
 
-    command_prefixes = ['!vip', '!delvip', '!inactive', '!delqueue', '!clearqueue', '!queue_list']
+    command_prefixes = ['!vip', '!delvip', '!inactive', '!delqueue', '!clearqueue', '!queue_list', '!skip', '!unskip', '!skip_list']
     is_command = any(text_lower.startswith(cmd) for cmd in command_prefixes)
 
     if is_command:
@@ -953,53 +1190,87 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, f"{mention}, ⏳ ждем Вас через {need} сообществ!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
-    # ===== ПРОВЕРКА VIP-СООБЩЕСТВ =====
+    # ===== ПРОВЕРКА VIP-СООБЩЕСТВ (пакетно через execute) =====
     cleanup_expired_vip()
 
     with vip_groups_lock:
         if vip_groups:
-            missing_vip = []
+            # Собираем group_ids, исключая те, для которых есть skip
+            vip_group_ids = []
             for vip in vip_groups:
-                subscribed = check_user_subscription(user_id, vip['group_id'])
-                if subscribed is False:
-                    missing_vip.append(vip)
+                if is_skip_subscription(user_id, vip['group_id']):
+                    print(f"   ⏭️ Пропуск проверки (исключение) для VIP club{vip['group_id']}", flush=True)
+                    continue
+                vip_group_ids.append(vip['group_id'])
 
-            if missing_vip:
+            if vip_group_ids:
+                # Пакетная проверка
+                vip_subscriptions = check_subscriptions_batch(user_id, vip_group_ids)
+                
+                missing_vip = []
+                for vip in vip_groups:
+                    if is_skip_subscription(user_id, vip['group_id']):
+                        continue
+                    subscribed = vip_subscriptions.get(vip['group_id'])
+                    if subscribed is False:
+                        missing_vip.append(vip)
+                    elif subscribed is None:
+                        print(f"   ⏭️ Пропуск (не удалось проверить) VIP club{vip['group_id']}", flush=True)
+                    # Если True — пропускаем
+
+                if missing_vip:
+                    if message_id:
+                        delete_message_by_conv_id(peer_id, message_id)
+                    text = f"{mention}, ⭐ обязательно подпишись на VIP-сообщества:\n\n"
+                    for vip in missing_vip:
+                        text += f"⭐ {make_clickable_link(vip['link'])}\n"
+                    text += f"\n{'─' * 30}\n"
+                    text += "⏳ На выполнение даётся 5 минут!\n"
+                    text += "✅ После того, как подпишешься, отправь свою ссылку снова.\n\n"
+                    text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
+                    send_message(peer_id, text)
+                    return
+
+    # ===== ПРОВЕРКА ОБЫЧНЫХ СООБЩЕСТВ (пакетно через execute) =====
+    with queue_lock:
+        regular_groups = [item for item in queue[-10:]]
+
+    if regular_groups:
+        # Собираем group_ids, исключая те, для которых есть skip
+        regular_group_ids = []
+        for item in regular_groups:
+            if is_skip_subscription(user_id, item['group_id']):
+                print(f"   ⏭️ Пропуск проверки (исключение) для club{item['group_id']}", flush=True)
+                continue
+            regular_group_ids.append(item['group_id'])
+
+        if regular_group_ids:
+            # Пакетная проверка
+            regular_subscriptions = check_subscriptions_batch(user_id, regular_group_ids)
+            
+            missing_regular = []
+            for item in regular_groups:
+                if is_skip_subscription(user_id, item['group_id']):
+                    continue
+                subscribed = regular_subscriptions.get(item['group_id'])
+                if subscribed is False:
+                    missing_regular.append(item)
+                elif subscribed is None:
+                    print(f"   ⏭️ Пропуск (не удалось проверить) club{item['group_id']}", flush=True)
+                # Если True — пропускаем
+
+            if missing_regular:
                 if message_id:
                     delete_message_by_conv_id(peer_id, message_id)
-                text = f"{mention}, ⭐ обязательно подпишись на VIP-сообщества:\n\n"
-                for vip in missing_vip:
-                    text += f"⭐ {make_clickable_link(vip['link'])}\n"
+                text = f"{mention}, 📋 обязательно подпишись на предыдущие 10 сообществ:\n\n"
+                for item in missing_regular:
+                    text += f"▫️ {make_clickable_link(item['link'])}\n"
                 text += f"\n{'─' * 30}\n"
                 text += "⏳ На выполнение даётся 5 минут!\n"
                 text += "✅ После того, как подпишешься, отправь свою ссылку снова.\n\n"
                 text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
                 send_message(peer_id, text)
                 return
-
-    # ===== ПРОВЕРКА ОБЫЧНЫХ СООБЩЕСТВ (ВСЕ последние 10) =====
-    with queue_lock:
-        regular_groups = [item for item in queue[-10:]]
-
-    if regular_groups:
-        missing_regular = []
-        for item in regular_groups:
-            subscribed = check_user_subscription(user_id, item['group_id'])
-            if subscribed is False:
-                missing_regular.append(item)
-
-        if missing_regular:
-            if message_id:
-                delete_message_by_conv_id(peer_id, message_id)
-            text = f"{mention}, 📋 обязательно подпишись на предыдущие 10 сообществ:\n\n"
-            for item in missing_regular:
-                text += f"▫️ {make_clickable_link(item['link'])}\n"
-            text += f"\n{'─' * 30}\n"
-            text += "⏳ На выполнение даётся 5 минут!\n"
-            text += "✅ После того, как подпишешься, отправь свою ссылку снова.\n\n"
-            text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
-            send_message(peer_id, text)
-            return
 
     # ========== ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - ПУБЛИКУЕМ ==========
 
