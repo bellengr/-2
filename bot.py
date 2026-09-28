@@ -36,6 +36,7 @@ PORT = int(os.getenv('PORT', '3000'))
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '447457340')
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(',') if x.strip()]
 DELETE_AFTER = 300
+MIN_MEMBERS_COUNT = 10  # Минимальное количество участников в сообществе
 # =============================================================================
 
 MAX_QUEUE_SIZE = 10
@@ -61,6 +62,11 @@ activity_lock = threading.Lock()
 user_name_cache = {}
 user_name_cache_lock = threading.Lock()
 USER_NAME_CACHE_TTL = 3600
+
+# Кэш проверки сообществ
+group_info_cache = {}  # {group_id: (can_check, members_count, is_hidden, name, timestamp)}
+group_info_cache_lock = threading.Lock()
+GROUP_INFO_CACHE_TTL = 300  # 5 минут
 
 pending_deletions = []
 deletions_lock = threading.Lock()
@@ -508,6 +514,59 @@ def resolve_group(short_name_or_id: str) -> Optional[dict]:
         return None
 
 
+def get_group_info_cached(group_id: int) -> tuple:
+    """
+    Возвращает (can_check, members_count, is_hidden, name) с кэшированием.
+    can_check = True, если можно проверить подписку (подписчики не скрыты).
+    """
+    global vk_group
+    if vk_group is None:
+        return False, 0, True, ""
+    
+    now = time.time()
+    
+    # Проверяем кэш
+    with group_info_cache_lock:
+        if group_id in group_info_cache:
+            cached = group_info_cache[group_id]
+            if now - cached[4] < GROUP_INFO_CACHE_TTL:
+                return cached[0], cached[1], cached[2], cached[3]
+    
+    # Запрашиваем у VK API
+    try:
+        rate_limit()
+        response = vk_group.groups.getById(
+            group_id=group_id,
+            fields='members_count,is_members_hidden'
+        )
+        
+        group = None
+        if isinstance(response, list) and len(response) > 0:
+            group = response[0]
+        elif isinstance(response, dict) and 'groups' in response:
+            group = response['groups'][0] if response['groups'] else None
+        elif isinstance(response, dict):
+            group = response
+        
+        if not group:
+            return False, 0, True, ""
+        
+        members_count = group.get('members_count', 0)
+        is_hidden = group.get('is_members_hidden', 0) == 1
+        name = group.get('name', '')
+        can_check = not is_hidden
+        
+        # Сохраняем в кэш
+        with group_info_cache_lock:
+            group_info_cache[group_id] = (can_check, members_count, is_hidden, name, now)
+        
+        return can_check, members_count, is_hidden, name
+        
+    except Exception as e:
+        print(f"   ⚠️ Ошибка получения данных сообщества {group_id}: {e}", flush=True)
+        return False, 0, True, ""
+
+
 def parse_is_member_response(item) -> Optional[bool]:
     """
     Разбирает ответ от groups.isMember.
@@ -519,10 +578,10 @@ def parse_is_member_response(item) -> Optional[bool]:
     if item is None:
         return None
     
-    # Если это ошибка
+    # Если это ошибка — не смогли проверить
     if isinstance(item, dict) and 'error' in item:
         error_code = item['error'].get('error_code')
-        print(f"      ⚠️ Ошибка API: {error_code}", flush=True)
+        print(f"      ⚠️ Ошибка API: {error_code} (не удалось проверить)", flush=True)
         return None
     
     # Если это список (старый формат)
@@ -533,7 +592,6 @@ def parse_is_member_response(item) -> Optional[bool]:
     
     # Если это словарь
     if isinstance(item, dict):
-        # Если вообще нет ключа 'member' — значит, не смогли проверить
         if 'member' not in item:
             return None
         
@@ -561,9 +619,6 @@ def check_subscriptions_batch(user_id: int, group_ids: list) -> dict:
     """
     Проверяет подписки на несколько сообществ за один запрос через execute.
     Возвращает: {group_id: True/False/None}
-      True  — точно подписан
-      False — точно не подписан
-      None  — не смогли проверить (скрытые подписчики, ошибка, rate limit)
     """
     global vk_group
     if vk_group is None or not group_ids:
@@ -601,25 +656,25 @@ def check_subscriptions_batch(user_id: int, group_ids: list) -> dict:
                         elif parsed is False:
                             print(f"   ❌ club{gid} — НЕ подписан", flush=True)
                         else:
-                            print(f"   ⚠️ club{gid} — не удалось проверить (скрытые подписчики?)", flush=True)
+                            print(f"   ⏭️ club{gid} — пропуск (не удалось проверить)", flush=True)
                     else:
                         results[gid] = None
-                        print(f"   ⚠️ club{gid} — нет в ответе", flush=True)
+                        print(f"   ⏭️ club{gid} — пропуск (нет в ответе)", flush=True)
             else:
                 for gid in batch:
                     results[gid] = None
-                    print(f"   ⚠️ club{gid} — ответ не список", flush=True)
+                    print(f"   ⏭️ club{gid} — пропуск (ответ не список)", flush=True)
                     
         except ApiError as e:
             print(f"   ❌ Ошибка API: {e}", flush=True)
             for gid in batch:
                 results[gid] = None
-                print(f"   ⚠️ club{gid} — ошибка API", flush=True)
+                print(f"   ⏭️ club{gid} — пропуск (ошибка API)", flush=True)
         except Exception as e:
             print(f"   ❌ Ошибка сети: {e}", flush=True)
             for gid in batch:
                 results[gid] = None
-                print(f"   ⚠️ club{gid} — ошибка сети", flush=True)
+                print(f"   ⏭️ club{gid} — пропуск (ошибка сети)", flush=True)
     
     total = len(group_ids)
     ok_count = sum(1 for v in results.values() if v is True)
@@ -627,7 +682,7 @@ def check_subscriptions_batch(user_id: int, group_ids: list) -> dict:
     unknown_count = sum(1 for v in results.values() if v is None)
     
     print(f"   {'─' * 50}", flush=True)
-    print(f"   📊 Итог: ✅ {ok_count} | ❌ {fail_count} | ⚠️ {unknown_count} из {total}\n", flush=True)
+    print(f"   📊 Итог: ✅ {ok_count} | ❌ {fail_count} | ⏭️ {unknown_count} из {total}\n", flush=True)
     
     return results
 
@@ -1125,6 +1180,31 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             return
 
         gid = group_info['id']
+        
+        # ===== НОВАЯ ПРОВЕРКА: можно ли проверить подписку и достаточно ли участников =====
+        can_check, members_count, is_hidden, group_name = get_group_info_cached(gid)
+        
+        if not can_check:
+            send_message(peer_id,
+                f"{mention}, ⚠️ невозможно проверить подписку!\n\n"
+                f"📛 {group_name}\n"
+                f"👥 Участников: {members_count}\n"
+                f"🔒 Список подписчиков скрыт\n\n"
+                f"💡 Чтобы бот мог проверять подписку, отключите скрытие подписчиков в настройках сообщества.\n\n"
+                f"💎 По вопросам — пишите: https://vk.com/id1121274330"
+            )
+            return
+        
+        if members_count < MIN_MEMBERS_COUNT:
+            send_message(peer_id,
+                f"{mention}, ⚠️ в сообществе меньше {MIN_MEMBERS_COUNT} участников!\n\n"
+                f"📛 {group_name}\n"
+                f"👥 Участников: {members_count}\n\n"
+                f"💡 Публикуем только сообщества с {MIN_MEMBERS_COUNT}+ участниками.\n\n"
+                f"💎 По вопросам — пишите: https://vk.com/id1121274330"
+            )
+            return
+
         display_link = f"club{gid}"
 
         with queue_lock:
@@ -1137,7 +1217,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             if len(queue) > MAX_QUEUE_SIZE:
                 queue.pop(0)
             save_queue()
-        send_message(peer_id, f"{mention}, ✅ сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}")
+        send_message(peer_id, f"{mention}, ✅ сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_name}")
         return
 
     # === ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ ===
@@ -1184,6 +1264,35 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         return
 
     gid = group_info['id']
+    
+    # ===== НОВАЯ ПРОВЕРКА: можно ли проверить подписку и достаточно ли участников =====
+    can_check, members_count, is_hidden, group_name = get_group_info_cached(gid)
+    
+    if not can_check:
+        if message_id:
+            delete_message_by_conv_id(peer_id, message_id)
+        send_message(peer_id,
+            f"{mention}, ⚠️ невозможно проверить подписку на это сообщество!\n\n"
+            f"📛 {group_name}\n"
+            f"👥 Участников: {members_count}\n"
+            f"🔒 Список подписчиков скрыт\n\n"
+            f"💡 Чтобы бот мог проверять подписку, владельцу сообщества нужно отключить скрытие подписчиков.\n\n"
+            f"💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
+        )
+        return
+    
+    if members_count < MIN_MEMBERS_COUNT:
+        if message_id:
+            delete_message_by_conv_id(peer_id, message_id)
+        send_message(peer_id,
+            f"{mention}, ⚠️ в сообществе меньше {MIN_MEMBERS_COUNT} участников!\n\n"
+            f"📛 {group_name}\n"
+            f"👥 Участников: {members_count}\n\n"
+            f"💡 Публикуем только сообщества с {MIN_MEMBERS_COUNT}+ участниками.\n\n"
+            f"💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
+        )
+        return
+
     display_link = f"club{gid}"
 
     if not can_user_post(user_id):
@@ -1216,8 +1325,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
                     subscribed = vip_subscriptions.get(vip['group_id'])
                     if subscribed is False:
                         missing_vip.append(vip)
-                    elif subscribed is None:
-                        print(f"   ⏭️ Пропуск (не удалось проверить) VIP club{vip['group_id']}", flush=True)
 
                 if missing_vip:
                     if message_id:
@@ -1255,8 +1362,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
                 subscribed = regular_subscriptions.get(item['group_id'])
                 if subscribed is False:
                     missing_regular.append(item)
-                elif subscribed is None:
-                    print(f"   ⏭️ Пропуск (не удалось проверить) club{item['group_id']}", flush=True)
 
             if missing_regular:
                 if message_id:
@@ -1291,7 +1396,7 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         }
     save_user_activity(user_id)
 
-    text = f"{mention}, ✅ ваше сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}\n📊 В очереди: {len(queue)}\n\n"
+    text = f"{mention}, ✅ ваше сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_name}\n📊 В очереди: {len(queue)}\n\n"
     text += "⏳ Ждем Вас через 5 сообществ!\n\n"
     text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
     send_message(peer_id, text)
