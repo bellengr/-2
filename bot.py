@@ -39,7 +39,7 @@ DELETE_AFTER = 300
 MIN_MEMBERS_COUNT = 10
 # =============================================================================
 
-MAX_QUEUE_SIZE = 7  # ← Очередь из 7 сообществ
+MAX_QUEUE_SIZE = 7
 VIP_DURATION_HOURS = 24
 RATE_LIMIT_DELAY = 0.5
 DB_FILE = "subscriptions_bot.db"
@@ -522,10 +522,6 @@ def resolve_group(short_name_or_id: str) -> Optional[dict]:
 
 
 def get_group_info_cached(group_id: int) -> tuple:
-    """
-    Возвращает (can_check, members_count, is_hidden, name) с кэшированием.
-    can_check = True, если можно проверить подписку (подписчики не скрыты).
-    """
     global vk_group
     if vk_group is None:
         return False, 0, True, ""
@@ -581,13 +577,6 @@ def get_group_info_cached(group_id: int) -> tuple:
 
 
 def parse_is_member_response(item) -> Optional[bool]:
-    """
-    Разбирает ответ от groups.isMember.
-    Возвращает:
-      True  — точно подписан
-      False — точно не подписан
-      None  — не удалось проверить (скрытые подписчики, ошибка)
-    """
     if item is None:
         return None
     
@@ -625,10 +614,6 @@ def parse_is_member_response(item) -> Optional[bool]:
 
 
 def check_subscriptions_batch(user_id: int, group_ids: list) -> dict:
-    """
-    Проверяет подписки на несколько сообществ за один запрос через execute.
-    Возвращает: {group_id: True/False/None}
-    """
     global vk_group
     if vk_group is None or not group_ids:
         return {}
@@ -934,7 +919,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
 
     cleanup_expired_vip()
 
-    # ===== КОМАНДА !vip =====
     if text_lower.startswith('!vip '):
         try:
             raw_arg = text.split()[1]
@@ -975,7 +959,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
         send_message(peer_id, f"⭐ VIP-сообщество добавлено на 24 часа!\n🔗 {make_clickable_link(display_link)}\n📛 {group_info['name']}")
         return True
 
-    # ===== КОМАНДА !delvip =====
     if text_lower.startswith('!delvip'):
         parts = text.split()
         if len(parts) >= 2:
@@ -1004,7 +987,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, "⚠️ Использование: !delvip [ссылка]")
         return True
 
-    # ===== КОМАНДА !vip_list =====
     if text_lower == '!vip_list':
         with vip_groups_lock:
             if not vip_groups:
@@ -1019,13 +1001,11 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, result)
         return True
 
-    # ===== КОМАНДА !inactive =====
     if text_lower == '!inactive':
         inactive_text = get_inactive_users(peer_id)
         send_message(peer_id, inactive_text)
         return True
 
-    # ===== КОМАНДА !delqueue =====
     if text_lower.startswith('!delqueue'):
         parts = text.split()
         if len(parts) >= 2:
@@ -1055,7 +1035,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, "⚠️ Использование: !delqueue [ссылка]")
         return True
 
-    # ===== КОМАНДА !clearqueue =====
     if text_lower == '!clearqueue':
         with queue_lock:
             count = len(queue)
@@ -1065,7 +1044,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
         send_message(peer_id, f"✅ Очередь полностью очищена! (удалено {count})")
         return True
 
-    # ===== КОМАНДА !queue_list =====
     if text_lower == '!queue_list':
         with queue_lock:
             if not queue:
@@ -1077,13 +1055,11 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, result)
         return True
 
-    # ===== КОМАНДА !clearcache =====
     if text_lower == '!clearcache':
         count = clear_group_cache()
         send_message(peer_id, f"✅ Кэш сообществ очищен! (удалено {count} записей)")
         return True
 
-    # ===== КОМАНДА !checkgroup =====
     if text_lower.startswith('!checkgroup'):
         parts = text.split()
         if len(parts) >= 2:
@@ -1119,7 +1095,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
             send_message(peer_id, "⚠️ Использование: !checkgroup [ссылка]")
         return True
 
-    # ===== КОМАНДА !skip =====
     if text_lower.startswith('!skip '):
         parts = text.split()
         if len(parts) < 3:
@@ -1151,7 +1126,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
         send_message(peer_id, f"✅ Исключение добавлено!\n\n👤 Участник: {user_mention}\n📛 Сообщество: {group_info['name']}\n\nТеперь этот участник может пропустить проверку подписки на это сообщество.")
         return True
 
-    # ===== КОМАНДА !unskip =====
     if text_lower.startswith('!unskip '):
         parts = text.split()
         if len(parts) < 3:
@@ -1183,7 +1157,6 @@ def handle_admin_commands(text: str, user_id: int, peer_id: int, message_id: int
         send_message(peer_id, f"✅ Исключение удалено!\n\n👤 Участник: {user_mention}\n📛 Сообщество: {group_info['name']}\n\nТеперь участник снова проверяется на подписку.")
         return True
 
-    # ===== КОМАНДА !skip_list =====
     if text_lower == '!skip_list':
         with skip_subscriptions_lock:
             if not skip_subscriptions:
@@ -1219,7 +1192,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
 
     mention = get_mention(user_id)
 
-    # === ПУБЛИКАЦИЯ СООБЩЕСТВА АДМИНИСТРАТОРОМ ===
     if is_owner(user_id):
         short_name = extract_group_short_name(text)
         if not short_name:
@@ -1269,8 +1241,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
             save_queue()
         send_message(peer_id, f"{mention}, ✅ сообщество опубликовано!\n🔗 {make_clickable_link(display_link)}\n📛 {group_name}")
         return
-
-    # === ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ ===
 
     stripped = text.strip()
     short_name = extract_group_short_name(stripped)
@@ -1351,7 +1321,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
         send_message(peer_id, f"{mention}, ⏳ ждем Вас через {need} сообществ!\n\n💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330")
         return
 
-    # ===== ПРОВЕРКА VIP-СООБЩЕСТВ =====
     cleanup_expired_vip()
 
     with vip_groups_lock:
@@ -1388,7 +1357,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
                     send_message(peer_id, text)
                     return
 
-    # ===== ПРОВЕРКА ОБЫЧНЫХ СООБЩЕСТВ (ПОСЛЕДНИЕ 7) =====
     with queue_lock:
         regular_groups = [item for item in queue[-MAX_QUEUE_SIZE:]]
 
@@ -1424,8 +1392,6 @@ def process_message(peer_id: int, user_id: int, text: str, message_id: int, even
                 text += "💎 По вопросам и для покупки VIP — пишите: https://vk.com/id1121274330"
                 send_message(peer_id, text)
                 return
-
-    # ========== ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - ПУБЛИКУЕМ ==========
 
     with queue_lock:
         queue.append({
